@@ -75,8 +75,8 @@ def fit_core_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.DataFrame, 
                     {
                         "beta_lnV": beta_v,
                         "se_lnV_hc3": se_v,
-                        "BVR_10pct": beta_v * LOG_10PCT,
-                        "se_BVR_10pct": se_v * LOG_10PCT,
+                        "BVR_10pct": effect_from_log_coefficient(beta_v, LOG_10PCT),
+                        "se_BVR_10pct": effect_from_log_coefficient(se_v, LOG_10PCT),
                     }
                 )
                 total_rec["BVR_10pct_ci_low"], total_rec["BVR_10pct_ci_high"] = ci95(
@@ -129,10 +129,10 @@ def fit_core_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.DataFrame, 
                         "beta_lnH": beta_h,
                         "se_lnF_hc3": se_f,
                         "se_lnH_hc3": se_h,
-                        "BVR_F_10pct": beta_f * LOG_10PCT,
-                        "BVR_H_10pct": beta_h * LOG_10PCT,
-                        "Delta_F_minus_H_10pct": (beta_f - beta_h) * LOG_10PCT,
-                        "se_Delta_F_minus_H_10pct": math.sqrt(var_delta) * LOG_10PCT,
+                        "BVR_F_10pct": effect_from_log_coefficient(beta_f, LOG_10PCT),
+                        "BVR_H_10pct": effect_from_log_coefficient(beta_h, LOG_10PCT),
+                        "Delta_F_minus_H_10pct": effect_from_log_coefficient(beta_f - beta_h, LOG_10PCT),
+                        "se_Delta_F_minus_H_10pct": effect_from_log_coefficient(math.sqrt(var_delta), LOG_10PCT),
                     }
                 )
                 path_rec["Delta_F_minus_H_10pct_ci_low"], path_rec["Delta_F_minus_H_10pct_ci_high"] = ci95(
@@ -155,9 +155,6 @@ def fit_core_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.DataFrame, 
                 "var_lnV_resid": math.nan,
                 "BVR_decomp_sum_10pct": math.nan,
                 "BVR_decomp_identity_error_10pct": math.nan,
-                "source_class": "not_estimable",
-                "dominant_share": math.nan,
-                "offset_flag": False,
                 "estimable": bool(total_fit["estimable"] and path_fit["estimable"]),
                 "stable_city": bool(total_rec["stable_city"] and path_rec["stable_city"]),
             }
@@ -170,9 +167,7 @@ def fit_core_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.DataFrame, 
                     path_rec["beta_lnH"],
                     controls,
                 )
-                class_info = classify_source_contribution(total_rec["BVR_10pct"], dec["C_F_10pct"], dec["C_H_10pct"])
                 decomp_rec.update(dec)
-                decomp_rec.update(class_info)
                 decomp_rec["BVR_decomp_sum_10pct"] = decomp_rec["C_F_10pct"] + decomp_rec["C_H_10pct"]
                 decomp_rec["BVR_decomp_identity_error_10pct"] = (
                     decomp_rec["BVR_10pct"] - decomp_rec["BVR_decomp_sum_10pct"]
@@ -213,8 +208,12 @@ def fit_pooled_models(df: pd.DataFrame) -> pd.DataFrame:
                         "cluster_se": se,
                         "ci_low": lo,
                         "ci_high": hi,
-                        "per10pct_estimate": est * LOG_10PCT if name in {"lnV", "lnF", "lnH"} else math.nan,
-                        "per10pct_se": se * LOG_10PCT if name in {"lnV", "lnF", "lnH"} else math.nan,
+                        "per10pct_estimate": effect_from_log_coefficient(est, LOG_10PCT)
+                        if name in {"lnV", "lnF", "lnH"}
+                        else math.nan,
+                        "per10pct_se": effect_from_log_coefficient(se, LOG_10PCT)
+                        if name in {"lnV", "lnF", "lnH"}
+                        else math.nan,
                         "n_rows": fit["n"],
                         "n_uid": fit["n_cluster"],
                         "r2_within": fit["r2"],
@@ -226,8 +225,13 @@ def fit_pooled_models(df: pd.DataFrame) -> pd.DataFrame:
                 i_h = names.index("lnH")
                 beta = fit["beta"]
                 cov = fit["cov_cluster"]
-                d_est = float((beta[i_f] - beta[i_h]) * LOG_10PCT)
-                d_se = float(math.sqrt(max(cov[i_f, i_f] + cov[i_h, i_h] - 2.0 * cov[i_f, i_h], 0.0)) * LOG_10PCT)
+                d_est = float(effect_from_log_coefficient(beta[i_f] - beta[i_h], LOG_10PCT))
+                d_se = float(
+                    effect_from_log_coefficient(
+                        math.sqrt(max(cov[i_f, i_f] + cov[i_h, i_h] - 2.0 * cov[i_f, i_h], 0.0)),
+                        LOG_10PCT,
+                    )
+                )
                 lo, hi = ci95(d_est, d_se)
                 rows.append(
                     {
@@ -277,12 +281,4 @@ def write_core_outputs(
             summaries.append(summarize_distribution(frame, metric, ["model_tier"]))
     summary = pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame()
     write_csv(summary, core_dir / "summary_by_model_tier.csv")
-    write_json(
-        core_dir / "source_classification_rules.json",
-        {
-            "near_zero_degC_per_10pct": NEAR_ZERO_C_10PCT,
-            "dominance_share": DOMINANCE_SHARE,
-            "primary_tier": PRIMARY_TIER_ID,
-        },
-    )
     return summary

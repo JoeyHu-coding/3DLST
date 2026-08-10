@@ -87,22 +87,46 @@ def contribution_decomposition_fast(
 def pathway_record(uid: Any, part: pd.DataFrame, tier: ModelTier, min_rows: int = 100) -> dict[str, Any]:
     """Fit the primary pathway model for a city under a sensitivity setting."""
 
-    rec: dict[str, Any] = {UID: uid, "n_rows": int(len(part)), "estimable": False, "stable_city": False}
+    ln_f = pd.to_numeric(part["lnF"], errors="coerce").to_numpy(float)
+    ln_h = pd.to_numeric(part["lnH"], errors="coerce").to_numpy(float)
+
+    def finite_range(values: np.ndarray) -> float:
+        finite = values[np.isfinite(values)]
+        return float(np.ptp(finite)) if len(finite) else math.nan
+
+    ln_f_range = finite_range(ln_f)
+    ln_h_range = finite_range(ln_h)
+    rec: dict[str, Any] = {
+        UID: uid,
+        "n_rows": int(len(part)),
+        "n_model": 0,
+        "lnF_range": ln_f_range,
+        "lnH_range": ln_h_range,
+        "estimable": False,
+        "stable_city": False,
+    }
     if len(part) < max(MIN_ESTIMABLE_ROWS, min_rows):
         return rec
     y = part[RESPONSE].to_numpy(float)
     controls, names, dropped = build_control_design(part, tier)
-    x = np.column_stack([part["lnF"].to_numpy(float), part["lnH"].to_numpy(float), controls]) if controls.size else part[
-        ["lnF", "lnH"]
-    ].to_numpy(float)
+    x = np.column_stack([ln_f, ln_h, controls]) if controls.size else np.column_stack([ln_f, ln_h])
     fit = fit_ols_hc3(y, x)
-    rec.update({"control_names": ";".join(names), "dropped_controls": ";".join(dropped), "estimable": bool(fit["estimable"])})
+    rec.update(
+        {
+            "control_names": ";".join(names),
+            "dropped_controls": ";".join(dropped),
+            "estimable": bool(fit["estimable"]),
+            "n_model": int(fit["n"]),
+        }
+    )
     if fit["estimable"]:
         beta_f = float(fit["beta"][0])
         beta_h = float(fit["beta"][1])
         rec.update(
             {
-                "stable_city": bool(fit["n"] >= min_rows),
+                "stable_city": bool(
+                    fit["n"] >= min_rows and ln_f_range >= MIN_LOG_RANGE and ln_h_range >= MIN_LOG_RANGE
+                ),
                 "beta_lnF": beta_f,
                 "beta_lnH": beta_h,
                 "BVR_F_10pct": beta_f * LOG_10PCT,
@@ -112,6 +136,70 @@ def pathway_record(uid: Any, part: pd.DataFrame, tier: ModelTier, min_rows: int 
             }
         )
     return rec
+
+
+def control_diagnostics(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """Return city-level VIFs and morphology variance retained after four controls."""
+
+    primary_tier = next(tier for tier in MODEL_TIERS if tier.tier_id == PRIMARY_TIER_ID)
+    controls = list(primary_tier.controls)
+    predictors = ["lnF", "lnH", *controls]
+    required = [UID, *predictors]
+    missing = [column for column in required if column not in df.columns]
+    if missing:
+        raise ValueError(f"Control diagnostics are missing required columns: {missing}")
+
+    vif_rows: list[dict[str, Any]] = []
+    support_rows: list[dict[str, Any]] = []
+    for uid, part in df.groupby(UID, sort=False, observed=True):
+        values = part[predictors].apply(pd.to_numeric, errors="coerce")
+        complete = values.loc[np.all(np.isfinite(values.to_numpy(float)), axis=1)]
+        matrix = complete.to_numpy(float)
+        n_model = int(len(complete))
+
+        for index, predictor in enumerate(predictors):
+            vif = math.nan
+            if n_model > len(predictors):
+                response = matrix[:, index]
+                original_variance = float(np.var(response, ddof=0))
+                if original_variance <= 1e-12:
+                    vif = math.inf
+                else:
+                    other = np.delete(matrix, index, axis=1)
+                    design = np.column_stack([np.ones(n_model), other])
+                    coefficients = np.linalg.lstsq(design, response, rcond=None)[0]
+                    residual = response - design @ coefficients
+                    residual_variance = float(np.var(residual, ddof=0))
+                    vif = math.inf if residual_variance <= 1e-12 else original_variance / residual_variance
+            vif_rows.append({UID: uid, "predictor": predictor, "n_model": n_model, "vif": float(vif)})
+
+        control_matrix = complete[controls].to_numpy(float)
+        for predictor in ("lnF", "lnH"):
+            values_raw = complete[predictor].to_numpy(float)
+            original_variance = float(np.var(values_raw, ddof=0)) if n_model else math.nan
+            residual = residualize_fast(values_raw, control_matrix)
+            finite_residual = residual[np.isfinite(residual)]
+            residual_variance = float(np.var(finite_residual, ddof=0)) if len(finite_residual) else math.nan
+            fraction = (
+                residual_variance / original_variance
+                if math.isfinite(original_variance) and original_variance > 1e-12 and math.isfinite(residual_variance)
+                else math.nan
+            )
+            support_rows.append(
+                {
+                    UID: uid,
+                    "predictor": predictor,
+                    "n_model": n_model,
+                    "original_variance": original_variance,
+                    "residual_variance": residual_variance,
+                    "residual_variance_fraction": fraction,
+                }
+            )
+
+    return {
+        "predictor_vif": pd.DataFrame(vif_rows),
+        "morphology_support": pd.DataFrame(support_rows),
+    }
 
 
 def bootstrap_core_metrics(uid: Any, part: pd.DataFrame, tier: ModelTier, min_rows: int = 50) -> dict[str, Any]:
@@ -246,16 +334,21 @@ def sensitivity_configs(df: pd.DataFrame) -> pd.DataFrame:
     """Run sample-filter sensitivity checks for the primary pathway contrast."""
 
     rows: list[dict[str, Any]] = []
+    bf_labels = {0.005: "0005", 0.010: "001", 0.020: "002", 0.050: "005"}
     configs = [
-        {"config": "baseline_bf001_min100", "bf": 0.01, "min_rows": 100, "water_max": None, "winsor": False},
-        {"config": "bf0005_min100", "bf": 0.005, "min_rows": 100, "water_max": None, "winsor": False},
-        {"config": "bf002_min100", "bf": 0.02, "min_rows": 100, "water_max": None, "winsor": False},
-        {"config": "bf005_min100", "bf": 0.05, "min_rows": 100, "water_max": None, "winsor": False},
-        {"config": "bf001_min50", "bf": 0.01, "min_rows": 50, "water_max": None, "winsor": False},
-        {"config": "bf001_min200", "bf": 0.01, "min_rows": 200, "water_max": None, "winsor": False},
-        {"config": "bf001_water_le_020", "bf": 0.01, "min_rows": 100, "water_max": 0.20, "winsor": False},
-        {"config": "bf001_water_le_010", "bf": 0.01, "min_rows": 100, "water_max": 0.10, "winsor": False},
-        {"config": "bf001_lst_winsor_1_99", "bf": 0.01, "min_rows": 100, "water_max": None, "winsor": True},
+        {
+            "config": (
+                "baseline_bf001_min100"
+                if bf == 0.010 and min_rows == 100
+                else f"bf{bf_labels[bf]}_min{min_rows}"
+            ),
+            "bf": bf,
+            "min_rows": min_rows,
+            "water_max": None,
+            "winsor": False,
+        }
+        for bf in (0.005, 0.010, 0.020, 0.050)
+        for min_rows in (50, 100, 200)
     ]
     tier = next(t for t in MODEL_TIERS if t.tier_id == PRIMARY_TIER_ID)
     for cfg in configs:
@@ -281,6 +374,17 @@ def sensitivity_configs(df: pd.DataFrame) -> pd.DataFrame:
                 "Delta_10pct_median": float(stable["Delta_F_minus_H_10pct"].median()) if len(stable) else math.nan,
                 "Delta_10pct_q25": float(stable["Delta_F_minus_H_10pct"].quantile(0.25)) if len(stable) else math.nan,
                 "Delta_10pct_q75": float(stable["Delta_F_minus_H_10pct"].quantile(0.75)) if len(stable) else math.nan,
+                "share_Delta_gt_zero": float((stable["Delta_F_minus_H_10pct"] > 0.0).mean()) if len(stable) else math.nan,
+                "share_Delta10_gt_0p01C": float(
+                    (stable["Delta_F_minus_H_10pct"] > NEAR_ZERO_C_10PCT).mean()
+                )
+                if len(stable)
+                else math.nan,
+                "share_Delta10_lt_minus_0p01C": float(
+                    (stable["Delta_F_minus_H_10pct"] < -NEAR_ZERO_C_10PCT).mean()
+                )
+                if len(stable)
+                else math.nan,
                 "share_Delta_10pct_positive": float((stable["Delta_F_minus_H_10pct"] > NEAR_ZERO_C_10PCT).mean()) if len(stable) else math.nan,
                 "BVR_F_10pct_median": float(stable["BVR_F_10pct"].median()) if len(stable) else math.nan,
                 "BVR_H_10pct_median": float(stable["BVR_H_10pct"].median()) if len(stable) else math.nan,

@@ -25,10 +25,12 @@ except ImportError:  # pragma: no cover - exercised only when dependencies are m
 UID = "UID"
 RESPONSE = "Ts_anomaly"
 
-# The internal result scale follows the archived analysis: response per 10%
-# multiplicative increment. Per-1% display values can be obtained by dividing
-# these fields by 10 as a close small-increment display conversion.
+# Log-linear coefficients are converted to explicit multiplicative increments.
+# A 1% effect uses ln(1.01); a 10% effect uses ln(1.10).
+LOG_1PCT = float(np.log(1.01))
 LOG_10PCT = float(np.log(1.10))
+LOG_VOLUME_IDENTITY_ATOL = 1e-10
+LOG_VOLUME_IDENTITY_RTOL = 1e-10
 
 PRIMARY_TIER_ID = "M1_terrain_water"
 MAIN_BF_THRESHOLD = 0.01
@@ -36,7 +38,6 @@ MIN_ESTIMABLE_ROWS = 30
 MIN_STABLE_ROWS = 100
 MIN_LOG_RANGE = 0.2
 NEAR_ZERO_C_10PCT = 0.01
-DOMINANCE_SHARE = 0.65
 
 DEFAULT_BOOTSTRAP_REPLICATES = 200
 DEFAULT_BOOT_BLOCK_SIZE = 5
@@ -116,6 +117,21 @@ MODEL_TIERS = [
         True,
     ),
 ]
+
+PRIMARY_CONTROL_COLUMNS = (
+    "terrain_mean_m",
+    "slope_mean_deg",
+    "relief_p90_p10_m",
+    "p_water_1km",
+)
+
+MAIN_ANALYSIS_REQUIRED_COLUMNS = (
+    UID,
+    RESPONSE,
+    "BF",
+    "MBH_m",
+    *PRIMARY_CONTROL_COLUMNS,
+)
 
 
 CONTEXT_FIRST = [
@@ -260,6 +276,12 @@ def ci95(est: float, se: float) -> tuple[float, float]:
     return float(est - 1.96 * se), float(est + 1.96 * se)
 
 
+def effect_from_log_coefficient(coefficient: Any, log_increment: float) -> Any:
+    """Convert a log-linear coefficient to an effect for a log increment."""
+
+    return coefficient * log_increment
+
+
 def available_columns(path: Path) -> list[str]:
     """Read Parquet schema columns without loading the full table."""
 
@@ -272,10 +294,10 @@ def available_columns(path: Path) -> list[str]:
 
 
 def compute_missing_log_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Create eligibility and log morphology fields when absent."""
+    """Create eligibility and complete eligible log morphology fields."""
 
     out = df.copy()
-    for col in ["BF", "MBH_m", RESPONSE]:
+    for col in ["BF", "MBH_m", RESPONSE, "lnF", "lnH", "lnV"]:
         if col in out.columns:
             out[col] = pd.to_numeric(out[col], errors="coerce")
     if "eligible_hvca_main" not in out.columns:
@@ -287,16 +309,17 @@ def compute_missing_log_features(df: pd.DataFrame) -> pd.DataFrame:
     out["eligible_hvca_main"] = out["eligible_hvca_main"].astype(bool)
     if "lnF" not in out.columns:
         out["lnF"] = np.nan
-        mask = out["eligible_hvca_main"] & (out["BF"] > 0)
-        out.loc[mask, "lnF"] = np.log(out.loc[mask, "BF"].astype(float))
     if "lnH" not in out.columns:
         out["lnH"] = np.nan
-        mask = out["eligible_hvca_main"] & (out["MBH_m"] > 0)
-        out.loc[mask, "lnH"] = np.log(out.loc[mask, "MBH_m"].astype(float))
     if "lnV" not in out.columns:
         out["lnV"] = np.nan
-        mask = out["eligible_hvca_main"] & np.isfinite(out["lnF"]) & np.isfinite(out["lnH"])
-        out.loc[mask, "lnV"] = out.loc[mask, "lnF"] + out.loc[mask, "lnH"]
+    eligible = out["eligible_hvca_main"]
+    fill_ln_f = eligible & (out["BF"] > 0) & ~np.isfinite(out["lnF"])
+    out.loc[fill_ln_f, "lnF"] = np.log(out.loc[fill_ln_f, "BF"].astype(float))
+    fill_ln_h = eligible & (out["MBH_m"] > 0) & ~np.isfinite(out["lnH"])
+    out.loc[fill_ln_h, "lnH"] = np.log(out.loc[fill_ln_h, "MBH_m"].astype(float))
+    fill_ln_v = eligible & ~np.isfinite(out["lnV"]) & np.isfinite(out["lnF"]) & np.isfinite(out["lnH"])
+    out.loc[fill_ln_v, "lnV"] = out.loc[fill_ln_v, "lnF"] + out.loc[fill_ln_v, "lnH"]
     if "grid_distance_to_city_center_z" not in out.columns and {"grid_col", "grid_row"}.issubset(out.columns):
         for coord in ["grid_col", "grid_row"]:
             vals = pd.to_numeric(out[coord], errors="coerce")
@@ -305,6 +328,29 @@ def compute_missing_log_features(df: pd.DataFrame) -> pd.DataFrame:
             out[f"z_{coord}"] = ((vals - mean) / sd).replace([np.inf, -np.inf], np.nan).fillna(0.0)
         out["grid_distance_to_city_center_z"] = np.sqrt(out["z_grid_col"] ** 2 + out["z_grid_row"] ** 2)
     return out.replace([np.inf, -np.inf], np.nan)
+
+
+def validate_log_volume_identity(
+    df: pd.DataFrame,
+    atol: float = LOG_VOLUME_IDENTITY_ATOL,
+    rtol: float = LOG_VOLUME_IDENTITY_RTOL,
+) -> None:
+    """Require lnV = lnF + lnH for eligible rows with finite log values."""
+
+    ln_f = pd.to_numeric(df["lnF"], errors="coerce").to_numpy(dtype=np.float64)
+    ln_h = pd.to_numeric(df["lnH"], errors="coerce").to_numpy(dtype=np.float64)
+    ln_v = pd.to_numeric(df["lnV"], errors="coerce").to_numpy(dtype=np.float64)
+    eligible = df["eligible_hvca_main"].astype(bool).to_numpy()
+    finite = np.isfinite(ln_f) & np.isfinite(ln_h) & np.isfinite(ln_v)
+    expected = ln_f + ln_h
+    inconsistent = eligible & finite & ~np.isclose(ln_v, expected, atol=atol, rtol=rtol)
+    if np.any(inconsistent):
+        max_abs_error = float(np.max(np.abs(ln_v[inconsistent] - expected[inconsistent])))
+        raise ValueError(
+            "Analysis matrix violates lnV = lnF + lnH for "
+            f"{int(inconsistent.sum())} eligible row(s) with finite log values "
+            f"(atol={atol:g}, rtol={rtol:g}; maximum absolute error={max_abs_error:.6g})."
+        )
 
 
 def load_analysis_matrix(matrix_path: Path, max_cities: int | None = None) -> pd.DataFrame:
@@ -343,7 +389,14 @@ def load_analysis_matrix(matrix_path: Path, max_cities: int | None = None) -> pd
         "grid_distance_to_city_center_z",
         *CONTEXT_FIRST,
     }
-    columns = [col for col in available_columns(matrix_path) if col in needed]
+    schema_columns = available_columns(matrix_path)
+    missing_primary = [col for col in MAIN_ANALYSIS_REQUIRED_COLUMNS if col not in schema_columns]
+    if missing_primary:
+        raise ValueError(
+            "Analysis matrix is missing required columns for the primary analysis: "
+            f"{missing_primary}"
+        )
+    columns = [col for col in schema_columns if col in needed]
     df = pd.read_parquet(matrix_path, columns=columns)
     df = compute_missing_log_features(df)
 
@@ -367,10 +420,11 @@ def load_analysis_matrix(matrix_path: Path, max_cities: int | None = None) -> pd
             continue
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    required = [UID, RESPONSE, "BF", "MBH_m", "lnF", "lnH", "lnV", "eligible_hvca_main"]
+    required = [*MAIN_ANALYSIS_REQUIRED_COLUMNS, "lnF", "lnH", "lnV", "eligible_hvca_main"]
     missing = [col for col in required if col not in df.columns]
     if missing:
         raise ValueError(f"Analysis matrix is missing required columns: {missing}")
+    validate_log_volume_identity(df)
     return df
 
 
@@ -697,48 +751,9 @@ def contribution_decomposition(
     return {
         "C_F": c_f,
         "C_H": c_h,
-        "C_F_10pct": c_f * LOG_10PCT,
-        "C_H_10pct": c_h * LOG_10PCT,
+        "C_F_10pct": effect_from_log_coefficient(c_f, LOG_10PCT),
+        "C_H_10pct": effect_from_log_coefficient(c_h, LOG_10PCT),
         "var_lnV_resid": var_v,
-    }
-
-
-def classify_source_contribution(
-    bvr_10pct: float,
-    c_f_10pct: float,
-    c_h_10pct: float,
-    near_zero: float = NEAR_ZERO_C_10PCT,
-    dominance_share: float = DOMINANCE_SHARE,
-) -> dict[str, Any]:
-    """Classify whether total BVR is mainly footprint-, height-, or mixed-driven."""
-
-    if not all(math.isfinite(v) for v in [bvr_10pct, c_f_10pct, c_h_10pct]):
-        return {"source_class": "not_estimable", "dominant_share": math.nan, "offset_flag": False}
-    abs_sum = abs(c_f_10pct) + abs(c_h_10pct)
-    if abs(bvr_10pct) <= near_zero and abs_sum <= 2 * near_zero:
-        share = 0.0 if abs_sum == 0 else max(abs(c_f_10pct), abs(c_h_10pct)) / abs_sum
-        return {"source_class": "weak_response", "dominant_share": share, "offset_flag": False}
-    offset = (c_f_10pct > near_zero and c_h_10pct < -near_zero) or (
-        c_h_10pct > near_zero and c_f_10pct < -near_zero
-    )
-    if offset:
-        return {
-            "source_class": "offset_footprint_height_signals",
-            "dominant_share": max(abs(c_f_10pct), abs(c_h_10pct)) / abs_sum if abs_sum else math.nan,
-            "offset_flag": True,
-        }
-    share_f = abs(c_f_10pct) / abs_sum if abs_sum else math.nan
-    share_h = abs(c_h_10pct) / abs_sum if abs_sum else math.nan
-    if c_f_10pct > near_zero and share_f >= dominance_share:
-        return {"source_class": "footprint_driven_volume_warming", "dominant_share": share_f, "offset_flag": False}
-    if c_h_10pct > near_zero and share_h >= dominance_share:
-        return {"source_class": "height_driven_volume_warming", "dominant_share": share_h, "offset_flag": False}
-    if c_f_10pct > near_zero and c_h_10pct > near_zero:
-        return {"source_class": "mixed_source_volume_warming", "dominant_share": max(share_f, share_h), "offset_flag": False}
-    return {
-        "source_class": "other_or_cooling_response",
-        "dominant_share": max(share_f, share_h) if abs_sum else math.nan,
-        "offset_flag": False,
     }
 
 
@@ -787,10 +802,13 @@ def summarize_distribution(frame: pd.DataFrame, value_col: str, group_cols: Iter
 
 
 def add_per1_columns(frame: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    """Add approximate per-1% display columns from per-10% estimates."""
+    """Add exact 1% columns from coefficient-derived 10% estimates."""
 
     out = frame.copy()
     for col in cols:
         if col in out.columns:
-            out[col.replace("_10pct", "_per1pct_approx")] = pd.to_numeric(out[col], errors="coerce") / 10.0
+            if not col.endswith("_10pct"):
+                raise ValueError(f"Expected a _10pct column, got: {col}")
+            coefficient = pd.to_numeric(out[col], errors="coerce") / LOG_10PCT
+            out[f"{col[:-len('_10pct')]}_1pct"] = effect_from_log_coefficient(coefficient, LOG_1PCT)
     return out

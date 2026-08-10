@@ -20,9 +20,18 @@ once the analysis-ready grid matrix is available.
   footprint response (BVR-F), height response (BVR-H), footprint-height
   contrast, contribution accounting, and pooled fixed-effect diagnostics.
 - `mechanism_analysis.py` - sequential adjustment, surface-context path models,
-  grid-level interactions, and city-level moderator diagnostics.
+  grid-level interactions, city-level moderators, and leave-one-climate-group-
+  out ridge reconstruction.
 - `robustness_analysis.py` - same-volume horizontal versus vertical morphology
-  contrast, sample-filter sensitivity checks, and spatial block bootstrap.
+  contrast, the 12 footprint-threshold by minimum-grid checks, control-variable
+  diagnostics, and spatial block bootstrap.
+- `nonlinear_analysis.py` - grouped out-of-fold HGBR prediction, model-based
+  Monte Carlo Shapley attribution, and accumulated local effects.
+- `climate_typology.py` - risk-first Type I-IV assignment and Global
+  North/Global South composition statistics.
+- `sensor_validation.py` - analysis-ready-table checks for spatial support,
+  Landsat-GSHTD correspondence, and viewing-angle interactions.
+- `tests/` - compact synthetic tests for the public statistical functions.
 - `requirements.txt` - minimal Python dependencies.
 - `README.md` - this guide.
 
@@ -47,10 +56,22 @@ Country, Continent, climate_macro, income_group, climate_income_regime,
 city_size_class, fid_shared_by_multiple_uid
 ```
 
+The nonlinear, typology, and sensor modules accept separate analysis-ready
+city or matched-observation tables. Their function docstrings define the
+required columns. Raw image downloading, raster construction, manuscript
+assembly, and reviewer-response utilities are intentionally outside this
+public package.
+
 ## Installation
 
 ```bash
 python -m pip install -r requirements.txt
+```
+
+Run the compact test suite with:
+
+```bash
+python -m pytest -q
 ```
 
 ## Run
@@ -103,10 +124,19 @@ The entry point writes CSV and JSON files under the selected output directory:
 - `robustness/same_volume_matched_contrast.csv` - same-volume horizontal versus
   vertical morphology contrast.
 - `robustness/sensitivity_summary.csv` - footprint threshold, sample-size,
-  water-filter, and LST-trimming sensitivity checks.
+  and minimum-grid sensitivity checks across the full 4 x 3 design.
 - `robustness/spatial_block_bootstrap.csv` - within-city spatial block bootstrap
   support for the footprint-height contrast.
 - `run_manifest.json` - command, input, output, and run metadata.
+
+The additional modules expose DataFrame-in/DataFrame-out functions so that the
+prepared city and sensor tables can be analyzed without local path assumptions:
+
+```python
+from climate_typology import classify_risk_first_typology
+from nonlinear_analysis import grouped_oof_predictions
+from sensor_validation import compare_temperature_products
+```
 
 ## Method Scope
 
@@ -115,7 +145,8 @@ The response is within-city hottest-month LST anomaly. Building volume density
 is defined as footprint fraction times mean building height. The pathway model
 estimates the footprint path conditional on height and controls (BVR-F) and the
 height path conditional on footprint and controls (BVR-H) on the same log
-response scale.
+response scale. Reported 1% and 10% differences use the exact multipliers
+`log(1.01)` and `log(1.10)`.
 
 All estimates describe static 2020 within-city spatial association. The code
 does not estimate temporal construction effects, air-temperature effects,
@@ -126,5 +157,5 @@ thermal-comfort outcomes, or causal impacts of new buildings.
 ```text
 The analysis code is available at https://github.com/JoeyHu-coding/3DLST.
 The analysis-ready grid matrix, figure source data, and supplementary source
-tables will be cited separately after deposition in the selected data archive.
+tables are archived separately from the code repository.
 ```

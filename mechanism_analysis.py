@@ -6,6 +6,9 @@ surface context and broader city characteristics.
 
 from __future__ import annotations
 
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+
 from lst_common import *  # noqa: F403
 
 
@@ -88,6 +91,8 @@ def run_surface_context_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.
                 "n_model": int(fit["n"]),
                 "r2": fit["r2"],
                 "outcome_range": float(np.nanmax(y) - np.nanmin(y)),
+                "path_F_1pct": math.nan,
+                "path_H_1pct": math.nan,
                 "path_F_10pct": math.nan,
                 "path_H_10pct": math.nan,
                 **cctx,
@@ -99,6 +104,8 @@ def run_surface_context_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.
                         "beta_lnH": float(fit["beta"][1]),
                         "se_lnF_hc3": float(fit["se_hc3"][0]),
                         "se_lnH_hc3": float(fit["se_hc3"][1]),
+                        "path_F_1pct": float(fit["beta"][0] * LOG_1PCT),
+                        "path_H_1pct": float(fit["beta"][1] * LOG_1PCT),
                         "path_F_10pct": float(fit["beta"][0] * LOG_10PCT),
                         "path_H_10pct": float(fit["beta"][1] * LOG_10PCT),
                     }
@@ -121,6 +128,8 @@ def run_surface_context_models(df: pd.DataFrame, ctx: pd.DataFrame) -> tuple[pd.
                         "term": term,
                         "estimate": est,
                         "cluster_se": se,
+                        "per1pct_estimate": est * LOG_1PCT,
+                        "per1pct_se": se * LOG_1PCT,
                         "per10pct_estimate": est * LOG_10PCT,
                         "per10pct_se": se * LOG_10PCT,
                         "n_rows": fit["n"],
@@ -144,12 +153,18 @@ def run_grid_interactions(df: pd.DataFrame) -> pd.DataFrame:
         if len(part) < 1000 or part[moderator].nunique(dropna=True) < 5:
             continue
         z_mod = within_city_z(part, moderator)
+        ln_f_centered = demean_series(part, "lnF")
+        ln_h_centered = demean_series(part, "lnH")
+        interaction_f = ln_f_centered * z_mod
+        interaction_h = ln_h_centered * z_mod
+        interaction_f = interaction_f - interaction_f.groupby(part[UID], observed=True).transform("mean")
+        interaction_h = interaction_h - interaction_h.groupby(part[UID], observed=True).transform("mean")
         raw_arrays: list[np.ndarray] = [
-            demean_series(part, "lnF").to_numpy(float),
-            demean_series(part, "lnH").to_numpy(float),
+            ln_f_centered.to_numpy(float),
+            ln_h_centered.to_numpy(float),
             z_mod.to_numpy(float),
-            (part["lnF"].to_numpy(float) * z_mod.to_numpy(float)),
-            (part["lnH"].to_numpy(float) * z_mod.to_numpy(float)),
+            interaction_f.to_numpy(float),
+            interaction_h.to_numpy(float),
         ]
         raw_names = ["lnF", "lnH", f"z_{moderator}", f"lnF_x_z_{moderator}", f"lnH_x_z_{moderator}"]
         for control in base_tier.controls:
@@ -174,6 +189,8 @@ def run_grid_interactions(df: pd.DataFrame) -> pd.DataFrame:
                     "cluster_se": se,
                     "ci_low": lo,
                     "ci_high": hi,
+                    "per1pct_estimate": est * LOG_1PCT if math.isfinite(est) else math.nan,
+                    "per1pct_se": se * LOG_1PCT if math.isfinite(se) else math.nan,
                     "per10pct_estimate": est * LOG_10PCT if math.isfinite(est) else math.nan,
                     "per10pct_se": se * LOG_10PCT if math.isfinite(se) else math.nan,
                     "n_rows": fit["n"],
@@ -213,7 +230,7 @@ def run_city_moderators(total: pd.DataFrame, pathway: pd.DataFrame, decomp: pd.D
         .merge(
             decomp.loc[
                 (decomp["model_tier"] == PRIMARY_TIER_ID) & decomp["stable_city"].astype(bool),
-                [UID, "C_F_10pct", "C_H_10pct", "source_class"],
+                [UID, "C_F_10pct", "C_H_10pct"],
             ],
             on=UID,
             how="inner",
@@ -278,6 +295,136 @@ def run_city_moderators(total: pd.DataFrame, pathway: pd.DataFrame, decomp: pd.D
                     }
                 )
     return pd.DataFrame(rows)
+
+
+def nested_leave_climate_out(
+    frame: pd.DataFrame,
+    features: Iterable[str],
+    target: str,
+    climate_col: str = "climate_group",
+    alphas: Iterable[float] = (0.01, 0.1, 1.0, 10.0, 100.0),
+) -> dict[str, pd.DataFrame]:
+    """Evaluate Ridge models with nested leave-one-climate-group-out folds."""
+
+    feature_names = list(features)
+    if not feature_names:
+        raise ValueError("features must contain at least one column")
+    if len(set(feature_names)) != len(feature_names):
+        raise ValueError("features must be unique")
+    alpha_values = tuple(float(alpha) for alpha in alphas)
+    if not alpha_values or len(set(alpha_values)) != len(alpha_values):
+        raise ValueError("alphas must contain unique values")
+    if any(not math.isfinite(alpha) or alpha < 0.0 for alpha in alpha_values):
+        raise ValueError("alphas must be finite and non-negative")
+
+    required = [climate_col, *feature_names, target]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(f"Nested climate validation is missing required columns: {missing}")
+
+    work = frame[required].copy()
+    work["_row_position"] = np.arange(len(frame), dtype=int)
+    work["_row_index"] = frame.index.to_numpy()
+    for column in [*feature_names, target]:
+        work[column] = pd.to_numeric(work[column], errors="coerce")
+    finite = np.all(np.isfinite(work[[*feature_names, target]].to_numpy(float)), axis=1)
+    work = work.loc[finite & work[climate_col].notna()].copy()
+    climate_groups = list(pd.unique(work[climate_col]))
+    if len(climate_groups) < 3:
+        raise ValueError("nested leave-climate-out validation requires at least three climate groups")
+
+    prediction_rows: list[dict[str, Any]] = []
+    tuning_rows: list[dict[str, Any]] = []
+    audit_rows: list[dict[str, Any]] = []
+
+    def scaler_audit(scaler: StandardScaler) -> dict[str, float]:
+        audit: dict[str, float] = {}
+        for index, feature in enumerate(feature_names):
+            audit[f"scaler_mean_{feature}"] = float(scaler.mean_[index])
+            audit[f"scaler_scale_{feature}"] = float(scaler.scale_[index])
+        return audit
+
+    for held_out in climate_groups:
+        outer_test = work.loc[work[climate_col] == held_out]
+        outer_train = work.loc[work[climate_col] != held_out]
+        inner_groups = list(pd.unique(outer_train[climate_col]))
+        squared_errors: dict[float, list[float]] = {alpha: [] for alpha in alpha_values}
+
+        for validation_group in inner_groups:
+            inner_validation = outer_train.loc[outer_train[climate_col] == validation_group]
+            inner_train = outer_train.loc[outer_train[climate_col] != validation_group]
+            scaler = StandardScaler()
+            x_train = scaler.fit_transform(inner_train[feature_names].to_numpy(float))
+            x_validation = scaler.transform(inner_validation[feature_names].to_numpy(float))
+            y_train = inner_train[target].to_numpy(float)
+            y_validation = inner_validation[target].to_numpy(float)
+            train_groups = tuple(pd.unique(inner_train[climate_col]))
+            audit_rows.append(
+                {
+                    "stage": "inner",
+                    "held_out_climate": held_out,
+                    "validation_climate": validation_group,
+                    "train_climate_groups": train_groups,
+                    "n_train": int(len(inner_train)),
+                    "n_validation": int(len(inner_validation)),
+                    **scaler_audit(scaler),
+                }
+            )
+            for alpha in alpha_values:
+                model = Ridge(alpha=alpha)
+                model.fit(x_train, y_train)
+                predicted = model.predict(x_validation)
+                squared_errors[alpha].extend(np.square(y_validation - predicted).tolist())
+
+        inner_mse = {alpha: float(np.mean(squared_errors[alpha])) for alpha in alpha_values}
+        selected_alpha = min(alpha_values, key=lambda alpha: (inner_mse[alpha], alpha))
+        for alpha in alpha_values:
+            tuning_rows.append(
+                {
+                    "held_out_climate": held_out,
+                    "alpha": alpha,
+                    "inner_mse": inner_mse[alpha],
+                    "inner_rmse": float(math.sqrt(inner_mse[alpha])),
+                    "selected": bool(alpha == selected_alpha),
+                }
+            )
+
+        outer_scaler = StandardScaler()
+        x_outer_train = outer_scaler.fit_transform(outer_train[feature_names].to_numpy(float))
+        x_outer_test = outer_scaler.transform(outer_test[feature_names].to_numpy(float))
+        outer_model = Ridge(alpha=selected_alpha)
+        outer_model.fit(x_outer_train, outer_train[target].to_numpy(float))
+        outer_predictions = outer_model.predict(x_outer_test)
+        audit_rows.append(
+            {
+                "stage": "outer",
+                "held_out_climate": held_out,
+                "validation_climate": None,
+                "train_climate_groups": tuple(pd.unique(outer_train[climate_col])),
+                "n_train": int(len(outer_train)),
+                "n_validation": int(len(outer_test)),
+                **scaler_audit(outer_scaler),
+            }
+        )
+        for (_, row), predicted in zip(outer_test.iterrows(), outer_predictions):
+            prediction_rows.append(
+                {
+                    "row_position": int(row["_row_position"]),
+                    "row_index": row["_row_index"],
+                    climate_col: row[climate_col],
+                    "held_out_climate": held_out,
+                    "observed": float(row[target]),
+                    "predicted": float(predicted),
+                    "selected_alpha": selected_alpha,
+                }
+            )
+
+    predictions = pd.DataFrame(prediction_rows).sort_values("row_position").reset_index(drop=True)
+    return {
+        "predictions": predictions,
+        "tuning": pd.DataFrame(tuning_rows),
+        "fold_audit": pd.DataFrame(audit_rows),
+    }
 
 
 def write_mechanism_outputs(

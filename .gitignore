@@ -1,0 +1,40 @@
+# Python caches and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local environments
+.venv/
+venv/
+env/
+
+# Data and generated analysis artifacts
+data/
+output/
+results/
+Figure/
+
+# Documents and editor/OS temporary files
+*.docx
+~$*.docx
+*.tmp
+*.temp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials
+.env
+.env.*
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.*
+secrets.*
