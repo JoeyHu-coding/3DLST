@@ -60,6 +60,16 @@ def _city_frame() -> pd.DataFrame:
     return frame
 
 
+def test_city_runner_defaults_to_the_formal_twelve_ale_bins(tmp_path: Path) -> None:
+    import run_city_analysis
+
+    args = run_city_analysis.parse_args(
+        ["--city-table", str(tmp_path / "city_analysis_core.csv")]
+    )
+
+    assert args.ale_bins == 12
+
+
 def test_city_runner_writes_core_nonlinear_and_typology_outputs(tmp_path: Path) -> None:
     import run_city_analysis
 

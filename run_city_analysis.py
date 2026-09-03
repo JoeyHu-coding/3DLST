@@ -65,7 +65,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--ale-bins",
         type=int,
-        default=10,
+        default=12,
         help="Quantile bins for accumulated local effects.",
     )
     parser.add_argument(
