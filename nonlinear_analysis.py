@@ -91,18 +91,23 @@ def grouped_oof_predictions(
     target_col: str,
     group_col: str,
     *,
+    fold_col: str | None = None,
     n_splits: int = 5,
     random_state: int = RANDOM_STATE,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return leakage-controlled grouped out-of-fold model predictions.
 
-    ``GroupKFold`` keeps each group wholly in one test fold.  Missing feature
-    values in both train and test partitions are filled only with medians from
-    that fold's training partition.
+    ``GroupKFold`` keeps each group wholly in one test fold.  Pass
+    ``fold_col`` to reuse a prespecified grouped partition instead.  Missing
+    feature values in both train and test partitions are filled only with
+    medians from that fold's training partition.
     """
 
     features = _validate_feature_columns(frame, feature_cols)
-    missing = [column for column in (target_col, group_col) if column not in frame]
+    required = [target_col, group_col]
+    if fold_col is not None:
+        required.append(fold_col)
+    missing = [column for column in required if column not in frame]
     if missing:
         raise ValueError(f"frame is missing required columns: {', '.join(missing)}")
     if not isinstance(n_splits, (int, np.integer)) or n_splits < 2:
@@ -124,16 +129,59 @@ def grouped_oof_predictions(
         )
 
     predictions = np.full(len(frame), np.nan, dtype=float)
-    fold_ids = np.full(len(frame), -1, dtype=int)
+    unassigned_fold = np.iinfo(np.int64).min
+    fold_ids = np.full(len(frame), unassigned_fold, dtype=int)
     performance_rows: list[dict[str, Any]] = []
-    splitter = GroupKFold(n_splits=n_splits)
-    for fold, (train_index, test_index) in enumerate(
-        splitter.split(x, y, groups=groups), start=1
-    ):
+    if fold_col is None:
+        splitter_name = "GroupKFold"
+        splitter = GroupKFold(n_splits=n_splits)
+        folds = (
+            (fold, train_index, test_index)
+            for fold, (train_index, test_index) in enumerate(
+                splitter.split(x, y, groups=groups), start=1
+            )
+        )
+    else:
+        numeric_folds = pd.to_numeric(frame[fold_col], errors="coerce")
+        if numeric_folds.isna().any() or not np.isfinite(
+            numeric_folds.to_numpy(dtype=float)
+        ).all():
+            raise ValueError("prespecified fold values must be complete and finite")
+        if not np.equal(
+            numeric_folds.to_numpy(dtype=float),
+            np.floor(numeric_folds.to_numpy(dtype=float)),
+        ).all():
+            raise ValueError("prespecified fold values must be integers")
+        supplied_folds = numeric_folds.astype(int)
+        fold_labels = sorted(supplied_folds.unique().tolist())
+        if len(fold_labels) != n_splits:
+            raise ValueError(
+                f"n_splits={n_splits} does not match the number of "
+                f"prespecified folds ({len(fold_labels)})"
+            )
+        group_fold_counts = (
+            pd.DataFrame({"group": groups, "fold": supplied_folds})
+            .groupby("group", observed=True)["fold"]
+            .nunique()
+        )
+        if group_fold_counts.gt(1).any():
+            raise ValueError("each group must occur in exactly one prespecified fold")
+        splitter_name = "preassigned_grouped_folds"
+        fold_values = supplied_folds.to_numpy(dtype=int)
+        folds = (
+            (
+                fold,
+                np.flatnonzero(fold_values != fold),
+                np.flatnonzero(fold_values == fold),
+            )
+            for fold in fold_labels
+        )
+
+    for fold, train_index, test_index in folds:
         train_groups = set(groups.iloc[train_index])
         test_groups = set(groups.iloc[test_index])
         if not train_groups.isdisjoint(test_groups):
-            raise RuntimeError("GroupKFold produced overlapping train and test groups")
+            raise RuntimeError("training and test folds contain overlapping groups")
 
         medians = _training_medians(x.iloc[train_index])
         x_train = x.iloc[train_index].fillna(medians)
@@ -152,13 +200,13 @@ def grouped_oof_predictions(
                 "n_test_groups": int(len(test_groups)),
                 **_prediction_metrics(y[test_index], fold_prediction),
                 "model": "HistGradientBoostingRegressor_fixed_configuration",
-                "splitter": "GroupKFold",
+                "splitter": splitter_name,
                 "imputation": "training_fold_feature_median",
                 "model_prediction_kind": MODEL_PREDICTION_KIND,
             }
         )
 
-    if not np.isfinite(predictions).all() or np.any(fold_ids < 1):
+    if not np.isfinite(predictions).all() or np.any(fold_ids == unassigned_fold):
         raise RuntimeError("out-of-fold predictions did not cover every input row")
     performance_rows.append(
         {
@@ -169,7 +217,7 @@ def grouped_oof_predictions(
             "n_test_groups": n_groups,
             **_prediction_metrics(y, predictions),
             "model": "HistGradientBoostingRegressor_fixed_configuration",
-            "splitter": "GroupKFold",
+            "splitter": splitter_name,
             "imputation": "training_fold_feature_median",
             "model_prediction_kind": MODEL_PREDICTION_KIND,
         }

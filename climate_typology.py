@@ -38,10 +38,10 @@ def _require_columns(frame: pd.DataFrame, columns: Sequence[str]) -> None:
 
 def classify_risk_first_typology(
     frame: pd.DataFrame,
-    footprint_col: str = "BVR_F_10pct",
-    height_col: str = "BVR_H_10pct",
-    ci_low_col: str = "Delta_ci_low",
-    ci_high_col: str = "Delta_ci_high",
+    footprint_col: str = "BVR_F_10",
+    height_col: str = "BVR_H_10",
+    ci_low_col: str = "allocation_contrast_ci_low",
+    ci_high_col: str = "allocation_contrast_ci_high",
 ) -> pd.DataFrame:
     """Assign mutually exclusive risk-first pathway types.
 

@@ -19,10 +19,10 @@ def test_risk_first_typology_is_mutually_exclusive_and_type_iii_has_priority() -
     climate_typology = _module("climate_typology")
     frame = pd.DataFrame(
         {
-            "BVR_F_10pct": [0.06, 0.03, 0.03, 0.00, 0.04, 0.01],
-            "BVR_H_10pct": [0.03, 0.00, 0.06, 0.03, 0.035, 0.005],
-            "Delta_ci_low": [0.01, 0.01, -0.05, -0.05, -0.01, -0.01],
-            "Delta_ci_high": [0.05, 0.05, -0.01, -0.01, 0.02, 0.02],
+            "BVR_F_10": [0.06, 0.03, 0.03, 0.00, 0.04, 0.01],
+            "BVR_H_10": [0.03, 0.00, 0.06, 0.03, 0.035, 0.005],
+            "allocation_contrast_ci_low": [0.01, 0.01, -0.05, -0.05, -0.01, -0.01],
+            "allocation_contrast_ci_high": [0.05, 0.05, -0.01, -0.01, 0.02, 0.02],
         },
         index=[10, 11, 12, 13, 14, 15],
     )
@@ -46,10 +46,10 @@ def test_risk_first_typology_uses_strict_threshold_boundaries() -> None:
     climate_typology = _module("climate_typology")
     frame = pd.DataFrame(
         {
-            "BVR_F_10pct": [0.03, 0.03, 0.00, 0.02],
-            "BVR_H_10pct": [0.02, 0.02, 0.01, 0.021],
-            "Delta_ci_low": [0.001, 0.0, -0.02, -0.02],
-            "Delta_ci_high": [0.02, 0.02, 0.0, 0.02],
+            "BVR_F_10": [0.03, 0.03, 0.00, 0.02],
+            "BVR_H_10": [0.02, 0.02, 0.01, 0.021],
+            "allocation_contrast_ci_low": [0.001, 0.0, -0.02, -0.02],
+            "allocation_contrast_ci_high": [0.02, 0.02, 0.0, 0.02],
         }
     )
 
@@ -168,6 +168,39 @@ def test_grouped_oof_predictions_cover_rows_without_group_leakage() -> None:
     assert performance["model_prediction_kind"].eq(
         "held_out_group_model_prediction_not_causal_effect"
     ).all()
+
+
+def test_grouped_oof_predictions_preserve_preassigned_group_folds() -> None:
+    nonlinear_analysis = _module("nonlinear_analysis")
+    rng = np.random.default_rng(29)
+    components = np.repeat([f"OC_{index}" for index in range(10)], 4)
+    supplied_folds = np.repeat(np.arange(5), 8)
+    x1 = rng.normal(size=len(components))
+    x2 = rng.normal(size=len(components))
+    frame = pd.DataFrame(
+        {
+            "city_overlap_component": components,
+            "outer_fold": supplied_folds,
+            "x1": x1,
+            "x2": x2,
+            "target": 0.8 * x1 - 0.2 * x2,
+        }
+    )
+
+    predictions, performance = nonlinear_analysis.grouped_oof_predictions(
+        frame,
+        feature_cols=["x1", "x2"],
+        target_col="target",
+        group_col="city_overlap_component",
+        fold_col="outer_fold",
+        n_splits=5,
+    )
+
+    assert predictions["fold"].tolist() == frame["outer_fold"].tolist()
+    assert predictions.groupby("city_overlap_component")["fold"].nunique().eq(1).all()
+    assert performance["splitter"].eq("preassigned_grouped_folds").all()
+    pooled = performance.loc[performance["evaluation_scope"].eq("pooled_oof")]
+    assert pooled["n_observations"].iat[0] == len(frame)
 
 
 def test_monte_carlo_shapley_is_deterministic_and_reconstructs_model_prediction() -> None:
