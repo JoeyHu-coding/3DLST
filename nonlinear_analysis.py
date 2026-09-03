@@ -332,7 +332,9 @@ def accumulated_local_effects(
         raise ValueError("no quantile bin meets min_bin_count")
 
     result = pd.DataFrame(rows)
-    accumulated = result["mean_local_model_prediction_effect"].cumsum().to_numpy()
+    accumulated = result[
+        "mean_local_model_prediction_effect"
+    ].cumsum().to_numpy(copy=True)
     weights = result["n_bin"].to_numpy(dtype=float)
     accumulated -= float(np.average(accumulated, weights=weights))
     result["ale_model_prediction_effect"] = accumulated
